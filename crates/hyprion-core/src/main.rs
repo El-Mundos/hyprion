@@ -8,7 +8,6 @@ const SOCKET_PATH: &str = "/tmp/hyprion-core.sock";
 
 #[tokio::main]
 async fn main() {
-    // Remove leftover socket from previous run
     let _ = fs::remove_file(SOCKET_PATH);
 
     let listener = UnixListener::bind(SOCKET_PATH).expect("Failed to bind to socket");
@@ -44,29 +43,26 @@ async fn handle_connection(stream: tokio::net::UnixStream) {
                 break;
             }
             Ok(_) => {
-                let response = match serde_json::from_str::<ipc::Request>(&line) {
-                    Ok(request) => handle_request(request),
-                    Err(e) => ipc::Response::Error {
-                        message: format!("Invalid request: {}", e),
-                    },
-                };
-
-                let mut json = serde_json::to_string(&response).unwrap();
-                json.push('\n');
-                writer.write_all(json.as_bytes()).await.unwrap();
+                match serde_json::from_str::<ipc::Message>(&line) {
+                    Ok(message) => {
+                        println!("Received: {:?}", message);
+                        // TODO: handle message properly once state is implemented
+                    }
+                    Err(e) => {
+                        let error = ipc::Message::Event {
+                            name: "error".to_string(),
+                            payload: serde_json::json!({"message": e.to_string()}),
+                        };
+                        let mut json = serde_json::to_string(&error).unwrap();
+                        json.push('\n');
+                        writer.write_all(json.as_bytes()).await.unwrap();
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("Read error: {}", e);
                 break;
             }
         }
-    }
-}
-
-fn handle_request(request: ipc::Request) -> ipc::Response {
-    match request {
-        ipc::Request::GetTheme => ipc::Response::Ok,
-        ipc::Request::GetVolume => ipc::Response::Volume { level: 0 },
-        ipc::Request::SetVolume { level } => ipc::Response::Ok,
     }
 }
