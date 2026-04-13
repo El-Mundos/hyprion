@@ -1,6 +1,6 @@
 # Hyprion Architecture
 
-> Last updated: April 2026  
+> Last updated: April 2026 (rev 2)
 > This is a living document. Update it as decisions change.
 
 ---
@@ -28,8 +28,9 @@ In order of importance:
 
 | Binary                | Role                                                     | Status         |
 | --------------------- | -------------------------------------------------------- | -------------- |
-| `hyprion-core`        | Central daemon, state owner, event bus, IPC              | 🚧 In progress |
+| `hyprion-core`        | Central daemon, state cache, event bus, IPC router       | 🚧 In progress |
 | `hyprion-theme`       | Shared design token library (crate, not binary)          | 🚧 In progress |
+| `hyprionctl`          | CLI wrapper — wraps hyprctl + adds Hyprion commands      | 📋 Planned     |
 | `hyprion-bar`         | Status bar                                               | 📋 Planned     |
 | `hyprion-notif`       | Notification server (D-Bus)                              | 📋 Planned     |
 | `hyprion-osd`         | On-screen display (volume, brightness popups)            | 📋 Planned     |
@@ -47,19 +48,47 @@ In order of importance:
 
 ## Core Architecture
 
-### hyprion-core is the single source of truth
+### hyprion-core is a dumb router and state cache
 
-Core owns all shared state:
+Core does NOT know how to get volume, manage notifications, or handle any domain-specific logic. That belongs to the module that owns that domain.
 
-- Current theme
-- Volume level
-- Active notifications queue
-- Current workspace info (proxied from Hyprland IPC)
-- Clipboard history
-- Session info (current user, logged in users)
-- Any other state that multiple components need
+What core actually does:
 
-Modules are stateless. They connect to core, subscribe to events they care about, render or act on that state, and send commands back to core when the user does something. If a module crashes and restarts, it just reconnects and gets current state from core. Nothing is lost.
+- **Caches** the last known state reported by each module
+- **Routes** commands to the correct module
+- **Broadcasts** events to all subscribers
+- **Tracks** connected clients and their subscriptions
+- **Bridges** Hyprland's IPC into Hyprion events
+
+Modules own their domain completely. `hyprion-volume` knows how to talk to PipeWire — core just stores the last value it reported and tells everyone when it changes. If a module crashes and restarts, it reconnects, reports its current state, and everything continues. Nothing is lost.
+
+### Module ownership model
+
+Every domain is owned by exactly one module. Only the owning module can SET state for its domain. Anyone can GET cached state from core.
+
+Example:
+
+- `hyprion-volume` owns the `volume` domain
+- It connects to PipeWire, monitors changes, and reports them to core
+- When volume changes, it tells core → core broadcasts to all subscribers
+- Other modules (bar, osd) can read volume from core's cache
+- Other modules can send a `volume.set` command to core → core forwards it to `hyprion-volume` → `hyprion-volume` actually changes PipeWire volume → reports new value back to core
+
+Nobody bypasses the owning module. Core never talks to PipeWire directly.
+
+### Public commands
+
+Modules expose commands through core that anyone can trigger. These are declared when the module connects:
+
+```json
+{
+  "kind": "register",
+  "domain": "volume",
+  "commands": ["set", "increase", "decrease", "mute"]
+}
+```
+
+Core learns what commands exist and who handles them. When a client sends a command, core validates the domain/command exists and forwards it to the right module.
 
 ### Everything talks to one socket
 
@@ -82,9 +111,31 @@ D-Bus is battle-tested and every Linux app speaks it. We DO use D-Bus where the 
 
 ## IPC Protocol
 
-JSON over Unix socket, newline delimited. Three message kinds:
+JSON over Unix socket, newline delimited.
 
-### Command — change something
+### Message kinds
+
+**Register — module identifies itself and declares its domain**
+
+```json
+{
+  "kind": "register",
+  "domain": "volume",
+  "commands": ["set", "increase", "decrease", "mute"]
+}
+```
+
+**State report — module pushes its current state to core's cache**
+
+```json
+{
+  "kind": "state",
+  "domain": "volume",
+  "payload": { "level": 75, "muted": false }
+}
+```
+
+**Command — send a command to a module via core**
 
 ```json
 {
@@ -95,23 +146,54 @@ JSON over Unix socket, newline delimited. Three message kinds:
 }
 ```
 
-### Query — get current state
+**Query — get cached state for a domain**
 
 ```json
-{ "kind": "query", "domain": "volume", "action": "get" }
+{ "kind": "query", "domain": "volume" }
 ```
 
-### Subscribe — listen for events
+**Subscribe — listen for events**
 
 ```json
-{ "kind": "subscribe", "events": ["volume.changed", "workspace.changed"] }
+{ "kind": "subscribe", "events": ["volume.*", "workspace.changed"] }
 ```
 
-### Event — broadcast from core to all subscribers
+Supports wildcard `*` per domain, or `"*"` for all events.
+
+**Event — broadcast from core to all matching subscribers**
 
 ```json
-{ "kind": "event", "name": "volume.changed", "payload": { "level": 75 } }
+{
+  "kind": "event",
+  "name": "volume.changed",
+  "payload": { "level": 75, "muted": false }
+}
 ```
+
+### Event system
+
+Core's event system is completely generic — it does not know or care what events mean. Events are just:
+
+- A name (`domain.action`, e.g. `volume.changed`)
+- A raw JSON payload (core forwards it blind)
+
+Modules define their own event names. Core just pattern-matches subscriptions against event names and forwards. This means new modules can introduce new events without touching core.
+
+### Two tiers of events
+
+**Simple events** — state changes. Emitted automatically by core when a module reports new state:
+
+- `volume.changed`
+- `theme.changed`
+- `workspace.changed`
+
+**Complex events** — module-specific, emitted explicitly by the module:
+
+- `notif.dismissed`
+- `wallpaper.changed`
+- `screenshot.taken`
+
+Core forwards both identically. The distinction is only conceptual.
 
 ### Why JSON?
 
@@ -122,7 +204,29 @@ JSON over Unix socket, newline delimited. Three message kinds:
 
 ### Why event-driven instead of polling?
 
-Polling wastes CPU and adds latency. Event-driven means the bar updates the instant volume changes — zero delay, zero wasted cycles. A polling approach at even 1 second intervals would feel noticeably worse for things like workspace indicators.
+Polling wastes CPU and adds latency. Event-driven means the bar updates the instant volume changes — zero delay, zero wasted cycles.
+
+---
+
+## hyprionctl
+
+A CLI binary that serves as the command-line interface to Hyprion. It:
+
+- Wraps `hyprctl` for all existing Hyprland commands (so you only need one tool)
+- Adds Hyprion-specific commands on top
+
+Examples:
+
+```bash
+hyprionctl volume set 75
+hyprionctl volume increase 5
+hyprionctl theme set catppuccin-mocha
+hyprionctl notify "Build finished"
+hyprionctl workspace 2
+hyprionctl dispatch movewindow l   # wraps hyprctl dispatch
+```
+
+Under the hood it just connects to `core.sock` and sends the appropriate JSON message. Simple, scriptable, composable.
 
 ---
 
@@ -130,11 +234,12 @@ Polling wastes CPU and adds latency. Event-driven means the bar updates the inst
 
 Third party apps connect to `core.sock` exactly like any Hyprion component. No special treatment, no separate API surface. They can:
 
-- Query any state
+- Query any cached state
 - Subscribe to any events
-- Send commands to change state
+- Send commands to any module
+- Emit their own events
 
-The only constraint is what makes sense security-wise — destructive operations may require user confirmation in the future.
+The only constraint is SET operations — only the owning module can report state for its domain. Third parties can send commands which the owning module chooses to honor or reject.
 
 ---
 
@@ -309,6 +414,7 @@ hyprion/
 └── crates/
     ├── hyprion-core/       ← central daemon
     ├── hyprion-theme/      ← shared design token library
+    ├── hyprionctl/         ← CLI tool
     ├── hyprion-bar/
     ├── hyprion-notif/
     ├── hyprion-osd/
