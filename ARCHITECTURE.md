@@ -437,3 +437,47 @@ hyprion/
 - Wallpaper engine video decoding — ffmpeg bindings vs gstreamer?
 - Screenshot tool — build on top of existing Wayland screencopy protocol or deeper integration?
 - Clipboard — exactly how do we enhance wl-clipboard without replacing it?
+
+---
+
+## The `hyprland` Special Domain
+
+The `hyprland` domain is the only domain owned by core itself rather than an external module. Core bridges Hyprland's native IPC socket into Hyprion events.
+
+### Events
+
+Hyprland emits raw string events on its socket. Core translates these into proper Hyprion events under the `hyprland` domain:
+
+```
+hyprland.workspace.changed
+hyprland.window.focused
+hyprland.window.closed
+hyprland.monitor.added
+hyprland.monitor.removed
+hyprland.fullscreen.toggled
+```
+
+Subscribe to them like any other event:
+
+```json
+{ "kind": "subscribe", "events": ["hyprland.workspace.*"] }
+```
+
+### Commands
+
+Commands sent to the `hyprland` domain are forwarded directly to Hyprland via `hyprctl`. Core never shells out to `hyprctl` on its own — it speaks Hyprland's IPC socket directly.
+
+```json
+{
+  "kind": "command",
+  "domain": "hyprland",
+  "action": "dispatch",
+  "payload": { "cmd": "workspace 2" }
+}
+```
+
+This means `hyprionctl` never needs to call `hyprctl` separately — it just sends commands to core which handles the Hyprland communication.
+
+### Coverage
+
+The `hyprland` domain only exposes what we've explicitly implemented. As we add more Hyprland event support, more `hyprland.*` events become available. The rest of Hyprland's IPC is still accessible via `hyprionctl` passthrough for anything not yet natively supported.
