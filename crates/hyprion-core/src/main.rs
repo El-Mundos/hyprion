@@ -1,4 +1,6 @@
+mod client;
 mod ipc;
+mod state;
 
 use std::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
